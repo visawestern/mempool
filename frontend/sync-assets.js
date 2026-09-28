@@ -323,8 +323,10 @@ const downloadPromoVideo = async () => {
   }
 };
 
-// Download Liquid assets if configured
-const downloadLiquidAssets = () => {
+// Download Liquid assets if configured (hash-checked, see #3858; pattern from #3668)
+// Non-fatal by design: liquid is optional, so listing/API/file failures only warn
+// (per-repo and per-file isolation + raw fallback) and never throw to the main sync.
+const downloadLiquidAssets = async () => {
   if (configContent.BASE_MODULE !== 'liquid') {
     if (config.verbose) {
       console.log(`${LOG_TAG} BASE_MODULE is not set to Liquid (currently ${configContent.BASE_MODULE}), skipping downloading assets`);
@@ -332,26 +334,119 @@ const downloadLiquidAssets = () => {
     return;
   }
 
-  const liquidAssets = [
-    { file: 'assets.json', url: 'https://raw.githubusercontent.com/Blockstream/asset_registry_db/master/index.json' },
-    { file: 'assets.minimal.json', url: 'https://raw.githubusercontent.com/Blockstream/asset_registry_db/master/index.minimal.json' },
-    { file: 'assets-testnet.json', url: 'https://raw.githubusercontent.com/Blockstream/asset_registry_testnet_db/master/index.json' },
-    { file: 'assets-testnet.minimal.json', url: 'https://raw.githubusercontent.com/Blockstream/asset_registry_testnet_db/master/index.minimal.json' }
-  ];
+  console.log(`${LOG_TAG} \tChecking if liquid assets needs downloading or updating...`);
 
-  console.log(`${LOG_TAG} Downloading assets`);
-  liquidAssets.forEach(({ file, url }) => {
-    const fileName = file.replace(/^assets/, 'assets');
-    console.log(`${LOG_TAG} Downloading ${fileName}`);
-    downloadFile(`${ASSETS_PATH}/${fileName}`, url);
-  });
+  try {
+    const rawFallbackUrls = {
+      'assets.json': 'https://raw.githubusercontent.com/Blockstream/asset_registry_db/master/index.json',
+      'assets.minimal.json': 'https://raw.githubusercontent.com/Blockstream/asset_registry_db/master/index.minimal.json',
+      'assets-testnet.json': 'https://raw.githubusercontent.com/Blockstream/asset_registry_testnet_db/master/index.json',
+      'assets-testnet.minimal.json': 'https://raw.githubusercontent.com/Blockstream/asset_registry_testnet_db/master/index.minimal.json'
+    };
+
+    // Per-repo isolation: a failed mainnet listing must not block testnet and vice versa.
+    // Sequential (not Promise.all) keeps warn order deterministic; cost is ~2 RTT only for liquid.
+    let mainAssets = null;
+    try {
+      const contents = await fetchGitHubContents('/repos/Blockstream/asset_registry_db/contents/', !!config.githubToken);
+      if (Array.isArray(contents)) {
+        mainAssets = contents;
+      } else {
+        console.log(`${LOG_TAG} \t\tUnexpected listing response for asset_registry_db, will use raw fallback.`);
+      }
+    } catch (e) {
+      console.log(`${LOG_TAG} \t\tUnable to list liquid mainnet assets. Trying raw fallback. Reason: ${e instanceof Error ? e.message : e}`);
+    }
+
+    let testnetAssets = null;
+    try {
+      const contents = await fetchGitHubContents('/repos/Blockstream/asset_registry_testnet_db/contents/', !!config.githubToken);
+      if (Array.isArray(contents)) {
+        testnetAssets = contents;
+      } else {
+        console.log(`${LOG_TAG} \t\tUnexpected listing response for asset_registry_testnet_db, will use raw fallback.`);
+      }
+    } catch (e) {
+      console.log(`${LOG_TAG} \t\tUnable to list liquid testnet assets. Trying raw fallback. Reason: ${e instanceof Error ? e.message : e}`);
+    }
+
+    const findByName = (contents, name) => (Array.isArray(contents) ? contents.find((item) => item.type === 'file' && item.name === name) : undefined);
+
+    const liquidAssets = [
+      { file: 'assets.json', item: findByName(mainAssets, 'index.json') },
+      { file: 'assets.minimal.json', item: findByName(mainAssets, 'index.minimal.json') },
+      { file: 'assets-testnet.json', item: findByName(testnetAssets, 'index.json') },
+      { file: 'assets-testnet.minimal.json', item: findByName(testnetAssets, 'index.minimal.json') },
+    ];
+
+    let downloadedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+    let fallbackCount = 0;
+    for (const { file, item } of liquidAssets) {
+      // Raw fallback when this file has no listing (API 403/network/rename): best-effort direct download.
+      if (!item || !item.download_url) {
+        console.log(`${LOG_TAG} \t\t${file} has no registry listing, trying raw fallback...`);
+        if (config.dryRun) {
+          console.log(`${LOG_TAG} \t\tDRY_RUN is set, not downloading ${file} but we should`);
+          skippedCount++;
+          continue;
+        }
+        try {
+          await downloadFile(`${ASSETS_PATH}/${file}`, rawFallbackUrls[file]);
+          downloadedCount++;
+          fallbackCount++;
+        } catch (e) {
+          console.log(`${LOG_TAG} \t\tUnable to download liquid asset ${file} via raw fallback. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
+          failedCount++;
+        }
+        continue;
+      }
+
+      // Hash-checked path, isolated per file so one failure does not block the rest.
+      try {
+        // No mempool CDN mirror for the Blockstream registries: dummy pattern keeps getCDNUrl a no-op.
+        const downloaded = await processFileItem(item, {
+          filePath: `${ASSETS_PATH}/${file}`,
+          remoteHash: item.sha,
+          downloadUrl: item.download_url,
+          cdnPattern: { from: '__no_cdn__', to: '__no_cdn__' },
+          itemName: file,
+          downloadDir: `${ASSETS_PATH}/`,
+        });
+
+        if (downloaded) {
+          downloadedCount++;
+        } else {
+          skippedCount++;
+        }
+      } catch (e) {
+        console.log(`${LOG_TAG} \t\tUnable to download liquid asset ${file}. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
+        failedCount++;
+      }
+    }
+
+    const totalCount = liquidAssets.length;
+    let summary = `${LOG_TAG} \t\tDownloaded ${downloadedCount} and skipped ${skippedCount} of ${totalCount} liquid assets`;
+    if (fallbackCount) {
+      summary += ` (${fallbackCount} via raw fallback)`;
+    }
+    if (failedCount) {
+      summary += `, ${failedCount} failed (will retry at next restart)`;
+    }
+    console.log(summary);
+  } catch (e) {
+    // Safety net: liquid must never fail the whole sync (see mempool_review.md blocker §1).
+    console.log(`${LOG_TAG} \t\tUnable to download liquid assets. Trying again at next restart. Reason: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
 };
 
 // Main execution
 (async () => {
   try {
-    // Download Liquid assets (non-blocking)
-    downloadLiquidAssets();
+    // Download Liquid assets (hash-checked, awaited; non-fatal by design so failures never exit 1)
+    await downloadLiquidAssets();
 
     // Download GitHub assets sequentially
     if (config.verbose) {
